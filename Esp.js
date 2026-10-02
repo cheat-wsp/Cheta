@@ -1,501 +1,408 @@
-  // ==UserScript==
-  // @name         Krunker.io ESP
-  // @namespace    krunker-esp-v1
-  // @version      1.0.0
-  // @description  Box ESP + Wireframe ESP for Krunker.io
-  // @author       anon
-  // @match        *://krunker.io/*
-  // @match        *://*.krunker.io/*
-  // @grant        none
-  // @run-at       document-start
-  // ==/UserScript==
+// ==UserScript==
+// @name         Krunker ESP
+// @namespace    krunker-esp-local
+// @version      1.0
+// @description  Box ESP + Wireframe ESP for Krunker.io — no aimbot, no triggerbot, visual only
+// @author       Kovak
+// @match        *://krunker.io/*
+// @match        *://*.krunker.io/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
 
-  (function() {
-      'use strict';
+(function () {
+    'use strict';
 
-      // CONFIG
-      const CONFIG = {
-          masterEnabled: true,
-          boxEnabled: true,
-          wireframeEnabled: false,
-          enemyColor: 0xff0000,
-          teamColor: 0x00ff00,
-          boxThickness: 2,
-          boxOpacity: 0.8,
-          wireframeOpacity: 0.6,
-          hotkeys: {
-              master: 'KeyM',
-              box: 'KeyB',
-              wireframe: 'KeyV',
-              menu: 'KeyN'
-          }
-      };
+    const CONFIG = {
+        enabled: true,
+        box: true,
+        wireframe: false,
+        enemyColor: 0xff2b2b,
+        teamColor: 0x2bff6a,
+        boxOpacity: 0.85,
+        wireOpacity: 0.5,
+        boxPadding: 1.05,
+        hotkeys: {
+            master: 'KeyM',
+            box: 'KeyB',
+            wireframe: 'KeyV',
+            menu: 'KeyN'
+        }
+    };
 
-      // STATE
-      let scene = null;
-      let camera = null;
-      let renderer = null;
-      let espObjects = new Map(); // playerId -> { box, wireframe,
-  mesh }
-      let originalMaterials = new WeakMap(); // mesh -> original
-  material
-      let menuEl = null;
-      let menuVisible = false;
-      let hooked = false;
+    const state = {
+        scene: null,
+        camera: null,
+        espMap: new Map(), // mesh.uuid -> { box, wire, lastPos }
+        originalMats: new Map(),
+        menuEl: null,
+        menuVisible: false
+    };
 
-      // SETTINGS PERSISTENCE
-      function loadSettings() {
-          try {
-              const saved =
-  localStorage.getItem('krunker-esp-config');
-              if (saved) {
-                  const parsed = JSON.parse(saved);
-                  Object.assign(CONFIG, parsed);
-              }
-          } catch (e) {
-              console.warn('[Krunker ESP] Failed to load
-  settings:', e);
-          }
-      }
+    // ---------- persistence ----------
+    function load() {
+        try {
+            const raw = localStorage.getItem('krunker-esp-cfg');
+            if (raw) Object.assign(CONFIG, JSON.parse(raw));
+        } catch (_) {}
+    }
+    function save() {
+        try {
+            localStorage.setItem('krunker-esp-cfg', JSON.stringify(CONFIG));
+        } catch (_) {}
+    }
 
-      function saveSettings() {
-          try {
-              localStorage.setItem('krunker-esp-config',
-  JSON.stringify(CONFIG));
-          } catch (e) {
-              console.warn('[Krunker ESP] Failed to save
-  settings:', e);
-          }
-      }
+    // ---------- THREE hook ----------
+    function waitForThree(cb) {
+        const iv = setInterval(() => {
+            if (typeof window.THREE !== 'undefined' && window.THREE.WebGLRenderer) {
+                clearInterval(iv);
+                cb(window.THREE);
+            }
+        }, 120);
+    }
 
-      // HOOK THREE.JS RENDERER
-      function hookRenderer() {
-          if (hooked) return;
-          const checkThree = setInterval(() => {
-              if (typeof THREE !== 'undefined' &&
-  THREE.WebGLRenderer) {
-                  clearInterval(checkThree);
-                  const originalRender =
-  THREE.WebGLRenderer.prototype.render;
-                  THREE.WebGLRenderer.prototype.render =
-  function(sceneArg, cameraArg, ...rest) {
-                      scene = sceneArg;
-                      camera = cameraArg;
-                      renderer = this;
-                      if (CONFIG.masterEnabled) {
-                          updateESP();
-                      }
-                      return originalRender.call(this, sceneArg,
-  cameraArg, ...rest);
-                  };
-                  hooked = true;
-                  console.log('[Krunker ESP] Renderer hooked');
-              }
-          }, 100);
-      }
+    function hookRenderer(THREE) {
+        const proto = THREE.WebGLRenderer.prototype;
+        if (proto.__espHooked) return;
+        proto.__espHooked = true;
+        const orig = proto.render;
+        proto.render = function (sc, cam) {
+            state.scene = sc;
+            state.camera = cam;
+            try { updateESP(THREE); } catch (e) { console.error('[ESP]', e); }
+            return orig.apply(this, arguments);
+        };
+    }
 
-      // FIND PLAYERS IN SCENE
-      function findPlayers() {
-          if (!scene) return [];
-          const players = [];
-          const localPlayer = getLocalPlayer();
+    // ---------- player discovery ----------
+    function isPlayerMesh(obj) {
+        if (!obj || !obj.isMesh) return false;
+        const p = obj.player || obj.userData?.player;
+        if (!p) return false;
+        if (p.active === false) return false;
+        if (p.isYou === true) return false;
+        return true;
+    }
 
-          scene.traverse(obj => {
-              // Krunker player meshes have a .player property or
-  are part of player objects
-              // Adjust this check based on actual Krunker
-  structure
-              if (obj.isMesh && obj.player && obj.player.active &&
-  !obj.player.isYou) {
-                  const isEnemy = localPlayer ? obj.player.team !==
-  localPlayer.team : true;
-                  players.push({
-                      mesh: obj,
-                      player: obj.player,
-                      isEnemy,
-                      id: obj.player.id || obj.uuid
-                  });
-              }
-          });
-          return players;
-      }
+    function localTeam() {
+        const lp = window.localPlayer || window.me || window.game?.localPlayer;
+        return lp?.team ?? null;
+    }
 
-      // GET LOCAL PLAYER
-      function getLocalPlayer() {
-          // Krunker stores local player in window.me or similar
-          // Adjust based on actual game structure
-          if (typeof window.me !== 'undefined') return window.me;
-          if (typeof window.localPlayer !== 'undefined') return
-  window.localPlayer;
-          return null;
-      }
+    function collectPlayers(THREE) {
+        const list = [];
+        if (!state.scene) return list;
+        state.scene.traverse((o) => {
+            if (isPlayerMesh(o)) list.push(o);
+        });
+        return list;
+    }
 
-      // CREATE BOX ESP
-      function createBox(mesh, isEnemy) {
-          const box = new THREE.Box3().setFromObject(mesh);
-          const size = box.getSize(new THREE.Vector3());
-          const center = box.getCenter(new THREE.Vector3());
+    // ---------- box ----------
+    function buildBox(THREE, mesh, color) {
+        if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+        const bb = mesh.geometry.boundingBox.clone();
+        const size = bb.getSize(new THREE.Vector3()).multiplyScalar(CONFIG.boxPadding);
+        const center = bb.getCenter(new THREE.Vector3());
 
-          const boxGeo = new THREE.BoxGeometry(size.x, size.y,
-  size.z);
-          const edges = new THREE.EdgesGeometry(boxGeo);
-          const color = isEnemy ? CONFIG.enemyColor :
-  CONFIG.teamColor;
-          const mat = new THREE.LineBasicMaterial({
-              color: color,
-              linewidth: CONFIG.boxThickness,
-              transparent: true,
-              opacity: CONFIG.boxOpacity,
-              depthTest: false,
-              depthWrite: false
-          });
-          const line = new THREE.LineSegments(edges, mat);
-          line.position.copy(center);
-          line.renderOrder = 999;
-          return line;
-      }
+        const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
+        const edges = new THREE.EdgesGeometry(geo);
+        const mat = new THREE.LineBasicMaterial({
+            color: color,
+            transparent: true,
+            opacity: CONFIG.boxOpacity,
+            depthTest: false,
+            depthWrite: false
+        });
+        const line = new THREE.LineSegments(edges, mat);
+        line.renderOrder = 9999;
+        line.frustumCulled = false;
+        line.userData.__espOffset = center;
+        geo.dispose();
+        return line;
+    }
 
-      // CREATE WIREFRAME ESP
-      function createWireframe(mesh, isEnemy) {
-          const color = isEnemy ? CONFIG.enemyColor :
-  CONFIG.teamColor;
+    function positionBox(THREE, box, mesh) {
+        const off = box.userData.__espOffset;
+        box.position.copy(mesh.position);
+        box.position.add(off.clone().applyQuaternion(mesh.quaternion));
+        box.quaternion.copy(mesh.quaternion);
+        box.scale.copy(mesh.scale);
+    }
 
-          // Clone and apply wireframe material
-          const applyWireframe = (obj) => {
-              if (obj.isMesh && obj.geometry) {
-                  if (!originalMaterials.has(obj)) {
-                      originalMaterials.set(obj, obj.material);
-                  }
-                  const wireMat = new THREE.MeshBasicMaterial({
-                      color: color,
-                      wireframe: true,
-                      transparent: true,
-                      opacity: CONFIG.wireframeOpacity,
-                      depthTest: false,
-                      depthWrite: false
-                  });
-                  obj.material = wireMat;
-                  obj.renderOrder = 998;
-              }
-          };
+    // ---------- wireframe clone ----------
+    function buildWire(THREE, mesh, color) {
+        const clone = new THREE.Group();
+        clone.renderOrder = 9998;
+        clone.frustumCulled = false;
+        mesh.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                const mat = new THREE.MeshBasicMaterial({
+                    color: color,
+                    wireframe: true,
+                    transparent: true,
+                    opacity: CONFIG.wireOpacity,
+                    depthTest: false,
+                    depthWrite: false
+                });
+                const m = new THREE.Mesh(child.geometry, mat);
+                m.renderOrder = 9998;
+                m.frustumCulled = false;
+                child.updateWorldMatrix(true, false);
+                m.matrixAutoUpdate = false;
+                m.matrix.copy(child.matrixWorld);
+                clone.add(m);
+            }
+        });
+        return clone;
+    }
 
-          mesh.traverse(applyWireframe);
-          return mesh;
-      }
+    // ---------- per-frame update ----------
+    function updateESP(THREE) {
+        if (!state.scene) return;
+        if (!CONFIG.enabled) { teardownAll(); return; }
 
-      // RESTORE ORIGINAL MATERIALS
-      function restoreOriginalMaterial(mesh) {
-          mesh.traverse(obj => {
-              if (obj.isMesh && originalMaterials.has(obj)) {
-                  obj.material = originalMaterials.get(obj);
-                  originalMaterials.delete(obj);
-              }
-          });
-      }
+        const players = collectPlayers(THREE);
+        const lteam = localTeam();
+        const live = new Set();
 
-      // UPDATE ESP EVERY FRAME
-      function updateESP() {
-          if (!scene) return;
+        for (const mesh of players) {
+            const id = mesh.uuid;
+            live.add(id);
 
-          const players = findPlayers();
-          const currentIds = new Set(players.map(p => p.id));
+            const p = mesh.player || mesh.userData?.player;
+            const isEnemy = lteam == null ? true : (p.team !== lteam);
+            const color = isEnemy ? CONFIG.enemyColor : CONFIG.teamColor;
 
-          // Remove ESP for players no longer present
-          for (const [id, obj] of espObjects) {
-              if (!currentIds.has(id)) {
-                  if (obj.box) scene.remove(obj.box);
-                  if (obj.wireframe)
-  restoreOriginalMaterial(obj.mesh);
-                  espObjects.delete(id);
-              }
-          }
+            let entry = state.espMap.get(id);
+            if (!entry) {
+                entry = { box: null, wire: null };
+                state.espMap.set(id, entry);
+            }
 
-          // Add/update ESP for current players
-          for (const { mesh, player, isEnemy, id } of players) {
-              let obj = espObjects.get(id);
+            // box
+            if (CONFIG.box) {
+                if (!entry.box) {
+                    entry.box = buildBox(THREE, mesh, color);
+                    state.scene.add(entry.box);
+                } else {
+                    entry.box.material.color.setHex(color);
+                    entry.box.material.opacity = CONFIG.boxOpacity;
+                }
+                positionBox(THREE, entry.box, mesh);
+            } else if (entry.box) {
+                state.scene.remove(entry.box);
+                entry.box.geometry?.dispose();
+                entry.box.material?.dispose();
+                entry.box = null;
+            }
 
-              if (!obj) {
-                  obj = { box: null, wireframe: false, mesh: mesh
-  };
-                  espObjects.set(id, obj);
-              }
+            // wire
+            if (CONFIG.wireframe) {
+                if (!entry.wire) {
+                    entry.wire = buildWire(THREE, mesh, color);
+                    state.scene.add(entry.wire);
+                } else {
+                    entry.wire.traverse((c) => {
+                        if (c.isMesh) c.material.color.setHex(color);
+                    });
+                }
+                entry.wire.position.copy(mesh.position);
+                entry.wire.quaternion.copy(mesh.quaternion);
+                entry.wire.scale.copy(mesh.scale);
+            } else if (entry.wire) {
+                disposeGroup(entry.wire);
+                state.scene.remove(entry.wire);
+                entry.wire = null;
+            }
+        }
 
-              // Update box ESP
-              if (CONFIG.boxEnabled) {
-                  if (obj.box) scene.remove(obj.box);
-                  obj.box = createBox(mesh, isEnemy);
-                  scene.add(obj.box);
-              } else if (obj.box) {
-                  scene.remove(obj.box);
-                  obj.box = null;
-              }
+        // cleanup dead players
+        for (const [id, entry] of state.espMap) {
+            if (!live.has(id)) {
+                if (entry.box) {
+                    state.scene.remove(entry.box);
+                    entry.box.geometry?.dispose();
+                    entry.box.material?.dispose();
+                }
+                if (entry.wire) {
+                    disposeGroup(entry.wire);
+                    state.scene.remove(entry.wire);
+                }
+                state.espMap.delete(id);
+            }
+        }
+    }
 
-              // Update wireframe ESP
-              if (CONFIG.wireframeEnabled) {
-                  if (!obj.wireframe) {
-                      createWireframe(mesh, isEnemy);
-                      obj.wireframe = true;
-                  }
-              } else if (obj.wireframe) {
-                  restoreOriginalMaterial(mesh);
-                  obj.wireframe = false;
-              }
-          }
-      }
+    function disposeGroup(g) {
+        g.traverse((c) => {
+            if (c.isMesh) {
+                c.geometry?.dispose?.();
+                c.material?.dispose?.();
+            }
+        });
+    }
 
-      // HOTKEY HANDLING
-      function setupHotkeys() {
-          document.addEventListener('keydown', e => {
-              // Master toggle
-              if (e.code === CONFIG.hotkeys.master) {
-                  CONFIG.masterEnabled = !CONFIG.masterEnabled;
-                  if (!CONFIG.masterEnabled) {
-                      clearAllESP();
-                  }
-                  saveSettings();
-                  updateMenuStatus();
-                  e.preventDefault();
-              }
+    function teardownAll() {
+        for (const [, entry] of state.espMap) {
+            if (entry.box) {
+                state.scene?.remove(entry.box);
+                entry.box.geometry?.dispose();
+                entry.box.material?.dispose();
+            }
+            if (entry.wire) {
+                disposeGroup(entry.wire);
+                state.scene?.remove(entry.wire);
+            }
+        }
+        state.espMap.clear();
+    }
 
-              // Box toggle
-              if (e.code === CONFIG.hotkeys.box) {
-                  CONFIG.boxEnabled = !CONFIG.boxEnabled;
-                  saveSettings();
-                  updateMenuStatus();
-                  e.preventDefault();
-              }
+    // ---------- hotkeys ----------
+    function bindKeys() {
+        document.addEventListener('keydown', (e) => {
+            if (e.repeat) return;
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
 
-              // Wireframe toggle
-              if (e.code === CONFIG.hotkeys.wireframe) {
-                  CONFIG.wireframeEnabled =
-  !CONFIG.wireframeEnabled;
-                  saveSettings();
-                  updateMenuStatus();
-                  e.preventDefault();
-              }
+            switch (e.code) {
+                case CONFIG.hotkeys.master:
+                    CONFIG.enabled = !CONFIG.enabled;
+                    save(); refreshMenu();
+                    break;
+                case CONFIG.hotkeys.box:
+                    CONFIG.box = !CONFIG.box;
+                    save(); refreshMenu();
+                    break;
+                case CONFIG.hotkeys.wireframe:
+                    CONFIG.wireframe = !CONFIG.wireframe;
+                    save(); refreshMenu();
+                    break;
+                case CONFIG.hotkeys.menu:
+                    toggleMenu();
+                    break;
+            }
+        }, true);
+    }
 
-              // Menu toggle
-              if (e.code === CONFIG.hotkeys.menu) {
-                  toggleMenu();
-                  e.preventDefault();
-              }
-          });
-      }
+    // ---------- menu ----------
+    function buildMenu() {
+        const el = document.createElement('div');
+        el.id = 'krunker-esp-menu';
+        el.style.cssText = `
+            position: fixed; top: 12px; right: 12px;
+            background: rgba(8,10,12,0.92);
+            color: #d8e0ea;
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 12px; line-height: 1.5;
+            padding: 12px 14px;
+            border: 1px solid #2a3140;
+            border-radius: 6px;
+            z-index: 2147483647;
+            width: 230px;
+            user-select: none;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+            display: none;
+        `;
 
-      // CLEAR ALL ESP OBJECTS
-      function clearAllESP() {
-          for (const [id, obj] of espObjects) {
-              if (obj.box) scene.remove(obj.box);
-              if (obj.wireframe) restoreOriginalMaterial(obj.mesh);
-          }
-          espObjects.clear();
-      }
+        el.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span style="color:#7ee0a1;font-weight:600;letter-spacing:0.5px;">KRUNKER ESP</span>
+                <span id="kesp-close" style="cursor:pointer;color:#8892a6;">x</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin:3px 0;">
+                <span>Master [M]</span><span id="kesp-master">ON</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin:3px 0;">
+                <span>Box [B]</span><span id="kesp-box">ON</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin:3px 0;">
+                <span>Wireframe [V]</span><span id="kesp-wire">OFF</span>
+            </div>
+            <hr style="border:0;border-top:1px solid #2a3140;margin:8px 0;">
+            <div style="display:flex;justify-content:space-between;margin:3px 0;">
+                <span>Enemy</span><input type="color" id="kesp-c-enemy" style="width:36px;height:18px;border:0;background:none;">
+            </div>
+            <div style="display:flex;justify-content:space-between;margin:3px 0;">
+                <span>Team</span><input type="color" id="kesp-c-team" style="width:36px;height:18px;border:0;background:none;">
+            </div>
+            <div style="margin:6px 0 2px 0;">Box opacity <span id="kesp-op-val">0.85</span></div>
+            <input type="range" id="kesp-op" min="0.1" max="1" step="0.05" value="0.85" style="width:100%;">
+            <div style="margin:6px 0 2px 0;">Wire opacity <span id="kesp-wop-val">0.50</span></div>
+            <input type="range" id="kesp-wop" min="0.1" max="1" step="0.05" value="0.5" style="width:100%;">
+            <hr style="border:0;border-top:1px solid #2a3140;margin:8px 0;">
+            <div style="color:#8892a6;font-size:11px;">[N] toggle menu</div>
+        `;
 
-      // CREATE MENU OVERLAY
-      function createMenu() {
-          menuEl = document.createElement('div');
-          menuEl.id = 'krunker-esp-menu';
-          menuEl.style.cssText = `
-              position: fixed;
-              top: 10px;
-              right: 10px;
-              background: rgba(0, 0, 0, 0.9);
-              color: #fff;
-              font-family: 'Courier New', monospace;
-              font-size: 13px;
-              padding: 15px;
-              border: 2px solid #00ff00;
-              border-radius: 4px;
-              z-index: 999999;
-              display: none;
-              user-select: none;
-              box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-              min-width: 280px;
-          `;
+        document.body.appendChild(el);
+        state.menuEl = el;
 
-          menuEl.innerHTML = `
-              <div style="margin-bottom: 12px; color: #00ff00;
-  font-weight: bold; font-size: 14px; border-bottom: 1px solid
-  #00ff00; padding-bottom: 8px;">
-                  KRUNKER ESP v1.0
-              </div>
-              <div style="margin: 8px 0;">
-                  <label style="display: inline-block; width:
-  120px;">Master ESP:</label>
-                  <span id="esp-master-status" style="color: #0f0;
-  font-weight: bold;">ON</span>
-                  <span style="color: #888; margin-left:
-  8px;">[M]</span>
-              </div>
-              <div style="margin: 8px 0;">
-                  <label style="display: inline-block; width:
-  120px;">Box ESP:</label>
-                  <span id="esp-box-status" style="color: #0f0;
-  font-weight: bold;">ON</span>
-                  <span style="color: #888; margin-left:
-  8px;">[B]</span>
-              </div>
-              <div style="margin: 8px 0;">
-                  <label style="display: inline-block; width:
-  120px;">Wireframe:</label>
-                  <span id="esp-wf-status" style="color: #f00;
-  font-weight: bold;">OFF</span>
-                  <span style="color: #888; margin-left:
-  8px;">[V]</span>
-              </div>
-              <div style="border-top: 1px solid #444; margin: 12px
-  0; padding-top: 12px;">
-                  <div style="margin: 8px 0;">
-                      <label style="display: block; margin-bottom:
-  4px;">Enemy Color:</label>
-                      <input type="color" id="esp-enemy-color"
-  value="#ff0000" style="width: 60px; height: 30px; border: none;
-  cursor: pointer;">
-                  </div>
-                  <div style="margin: 8px 0;">
-                      <label style="display: block; margin-bottom:
-  4px;">Team Color:</label>
-                      <input type="color" id="esp-team-color"
-  value="#00ff00" style="width: 60px; height: 30px; border: none;
-  cursor: pointer;">
-                  </div>
-                  <div style="margin: 8px 0;">
-                      <label style="display: block; margin-bottom:
-  4px;">Box Thickness: <span id="thickness-val">2</span></label>
-                      <input type="range" id="esp-thickness"
-  min="1" max="10" value="2" style="width: 100%; cursor: pointer;">
-                  </div>
-                  <div style="margin: 8px 0;">
-                      <label style="display: block; margin-bottom:
-  4px;">Box Opacity: <span id="opacity-val">0.8</span></label>
-                      <input type="range" id="esp-opacity"
-  min="0.1" max="1" step="0.1" value="0.8" style="width: 100%;
-  cursor: pointer;">
-                  </div>
-              </div>
-              <div style="margin-top: 12px; padding-top: 8px;
-  border-top: 1px solid #444; color: #888; font-size: 11px;">
-                  Press [N] to toggle menu
-              </div>
-          `;
+        const hex = (n) => '#' + n.toString(16).padStart(6, '0');
+        const $ = (id) => el.querySelector(id);
 
-          document.body.appendChild(menuEl);
-          bindMenuInputs();
-      }
+        $('kesp-close').onclick = toggleMenu;
+        $('kesp-c-enemy').value = hex(CONFIG.enemyColor);
+        $('kesp-c-team').value = hex(CONFIG.teamColor);
+        $('kesp-op').value = CONFIG.boxOpacity;
+        $('kesp-wop').value = CONFIG.wireOpacity;
+        $('kesp-op-val').textContent = CONFIG.boxOpacity.toFixed(2);
+        $('kesp-wop-val').textContent = CONFIG.wireOpacity.toFixed(2);
 
-      // BIND MENU INPUTS
-      function bindMenuInputs() {
-          const enemyColorInput =
-  document.getElementById('esp-enemy-color');
-          const teamColorInput =
-  document.getElementById('esp-team-color');
-          const thicknessInput =
-  document.getElementById('esp-thickness');
-          const opacityInput =
-  document.getElementById('esp-opacity');
-          const thicknessVal =
-  document.getElementById('thickness-val');
-          const opacityVal =
-  document.getElementById('opacity-val');
+        $('kesp-c-enemy').oninput = (e) => {
+            CONFIG.enemyColor = parseInt(e.target.value.slice(1), 16);
+            save();
+        };
+        $('kesp-c-team').oninput = (e) => {
+            CONFIG.teamColor = parseInt(e.target.value.slice(1), 16);
+            save();
+        };
+        $('kesp-op').oninput = (e) => {
+            CONFIG.boxOpacity = parseFloat(e.target.value);
+            $('kesp-op-val').textContent = CONFIG.boxOpacity.toFixed(2);
+            save();
+        };
+        $('kesp-wop').oninput = (e) => {
+            CONFIG.wireOpacity = parseFloat(e.target.value);
+            $('kesp-wop-val').textContent = CONFIG.wireOpacity.toFixed(2);
+            save();
+        };
 
-          if (enemyColorInput) {
-              enemyColorInput.value = '#' +
-  CONFIG.enemyColor.toString(16).padStart(6, '0');
-              enemyColorInput.oninput = e => {
-                  CONFIG.enemyColor =
-  parseInt(e.target.value.slice(1), 16);
-                  saveSettings();
-              };
-          }
+        refreshMenu();
+    }
 
-          if (teamColorInput) {
-              teamColorInput.value = '#' +
-  CONFIG.teamColor.toString(16).padStart(6, '0');
-              teamColorInput.oninput = e => {
-                  CONFIG.teamColor =
-  parseInt(e.target.value.slice(1), 16);
-                  saveSettings();
-              };
-          }
+    function refreshMenu() {
+        if (!state.menuEl) return;
+        const set = (id, on) => {
+            const n = state.menuEl.querySelector(id);
+            if (n) { n.textContent = on ? 'ON' : 'OFF'; n.style.color = on ? '#7ee0a1' : '#8892a6'; }
+        };
+        set('#kesp-master', CONFIG.enabled);
+        set('#kesp-box', CONFIG.box);
+        set('#kesp-wire', CONFIG.wireframe);
+    }
 
-          if (thicknessInput && thicknessVal) {
-              thicknessInput.value = CONFIG.boxThickness;
-              thicknessVal.textContent = CONFIG.boxThickness;
-              thicknessInput.oninput = e => {
-                  CONFIG.boxThickness = parseInt(e.target.value);
-                  thicknessVal.textContent = CONFIG.boxThickness;
-                  saveSettings();
-              };
-          }
+    function toggleMenu() {
+        if (!state.menuEl) return;
+        state.menuVisible = !state.menuVisible;
+        state.menuEl.style.display = state.menuVisible ? 'block' : 'none';
+    }
 
-          if (opacityInput && opacityVal) {
-              opacityInput.value = CONFIG.boxOpacity;
-              opacityVal.textContent = CONFIG.boxOpacity;
-              opacityInput.oninput = e => {
-                  CONFIG.boxOpacity = parseFloat(e.target.value);
-                  opacityVal.textContent =
-  CONFIG.boxOpacity.toFixed(1);
-                  saveSettings();
-              };
-          }
-      }
+    // ---------- boot ----------
+    function boot() {
+        load();
+        waitForThree((THREE) => {
+            hookRenderer(THREE);
+        });
+        bindKeys();
 
-      // UPDATE MENU STATUS
-      function updateMenuStatus() {
-          const masterStatus =
-  document.getElementById('esp-master-status');
-          const boxStatus =
-  document.getElementById('esp-box-status');
-          const wfStatus =
-  document.getElementById('esp-wf-status');
+        const iv = setInterval(() => {
+            if (document.body) {
+                clearInterval(iv);
+                buildMenu();
+            }
+        }, 120);
+    }
 
-          if (masterStatus) {
-              masterStatus.textContent = CONFIG.masterEnabled ?
-  'ON' : 'OFF';
-              masterStatus.style.color = CONFIG.masterEnabled ?
-  '#0f0' : '#f00';
-          }
-          if (boxStatus) {
-              boxStatus.textContent = CONFIG.boxEnabled ? 'ON' :
-  'OFF';
-              boxStatus.style.color = CONFIG.boxEnabled ? '#0f0' :
-  '#f00';
-          }
-          if (wfStatus) {
-              wfStatus.textContent = CONFIG.wireframeEnabled ? 'ON'
-  : 'OFF';
-              wfStatus.style.color = CONFIG.wireframeEnabled ?
-  '#0f0' : '#f00';
-          }
-      }
-
-      // TOGGLE MENU
-      function toggleMenu() {
-          menuVisible = !menuVisible;
-          if (menuEl) {
-              menuEl.style.display = menuVisible ? 'block' :
-  'none';
-          }
-      }
-
-      // INIT
-      function init() {
-          loadSettings();
-          hookRenderer();
-          setupHotkeys();
-
-          const checkBody = setInterval(() => {
-              if (document.body) {
-                  clearInterval(checkBody);
-                  createMenu();
-                  updateMenuStatus();
-              }
-          }, 100);
-
-          console.log('[Krunker ESP] Loaded successfully');
-          console.log('[Krunker ESP] Hotkeys: [M] Master | [B] Box
-  | [V] Wireframe | [N] Menu');
-      }
-
-      init();
-  })();
+    boot();
+})();
