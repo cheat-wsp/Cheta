@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Krunker ESP
 // @namespace    krunker-esp-local
-// @version      1.0
+// @version      1.1
 // @description  Box ESP + Wireframe ESP for Krunker.io — no aimbot, no triggerbot, visual only
 // @author       Kovak
 // @match        *://krunker.io/*
 // @match        *://*.krunker.io/*
 // @grant        none
-// @run-at       document-start
+// @run-at       document-end
 // ==/UserScript==
 
 (function () {
@@ -33,13 +33,12 @@
     const state = {
         scene: null,
         camera: null,
-        espMap: new Map(), // mesh.uuid -> { box, wire, lastPos }
-        originalMats: new Map(),
+        espMap: new Map(),
         menuEl: null,
-        menuVisible: false
+        menuVisible: false,
+        refs: {}
     };
 
-    // ---------- persistence ----------
     function load() {
         try {
             const raw = localStorage.getItem('krunker-esp-cfg');
@@ -52,7 +51,6 @@
         } catch (_) {}
     }
 
-    // ---------- THREE hook ----------
     function waitForThree(cb) {
         const iv = setInterval(() => {
             if (typeof window.THREE !== 'undefined' && window.THREE.WebGLRenderer) {
@@ -75,7 +73,6 @@
         };
     }
 
-    // ---------- player discovery ----------
     function isPlayerMesh(obj) {
         if (!obj || !obj.isMesh) return false;
         const p = obj.player || obj.userData?.player;
@@ -90,7 +87,7 @@
         return lp?.team ?? null;
     }
 
-    function collectPlayers(THREE) {
+    function collectPlayers() {
         const list = [];
         if (!state.scene) return list;
         state.scene.traverse((o) => {
@@ -99,7 +96,6 @@
         return list;
     }
 
-    // ---------- box ----------
     function buildBox(THREE, mesh, color) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
         const bb = mesh.geometry.boundingBox.clone();
@@ -123,7 +119,7 @@
         return line;
     }
 
-    function positionBox(THREE, box, mesh) {
+    function positionBox(box, mesh) {
         const off = box.userData.__espOffset;
         box.position.copy(mesh.position);
         box.position.add(off.clone().applyQuaternion(mesh.quaternion));
@@ -131,7 +127,6 @@
         box.scale.copy(mesh.scale);
     }
 
-    // ---------- wireframe clone ----------
     function buildWire(THREE, mesh, color) {
         const clone = new THREE.Group();
         clone.renderOrder = 9998;
@@ -158,12 +153,11 @@
         return clone;
     }
 
-    // ---------- per-frame update ----------
     function updateESP(THREE) {
         if (!state.scene) return;
         if (!CONFIG.enabled) { teardownAll(); return; }
 
-        const players = collectPlayers(THREE);
+        const players = collectPlayers();
         const lteam = localTeam();
         const live = new Set();
 
@@ -181,7 +175,6 @@
                 state.espMap.set(id, entry);
             }
 
-            // box
             if (CONFIG.box) {
                 if (!entry.box) {
                     entry.box = buildBox(THREE, mesh, color);
@@ -190,7 +183,7 @@
                     entry.box.material.color.setHex(color);
                     entry.box.material.opacity = CONFIG.boxOpacity;
                 }
-                positionBox(THREE, entry.box, mesh);
+                positionBox(entry.box, mesh);
             } else if (entry.box) {
                 state.scene.remove(entry.box);
                 entry.box.geometry?.dispose();
@@ -198,7 +191,6 @@
                 entry.box = null;
             }
 
-            // wire
             if (CONFIG.wireframe) {
                 if (!entry.wire) {
                     entry.wire = buildWire(THREE, mesh, color);
@@ -218,7 +210,6 @@
             }
         }
 
-        // cleanup dead players
         for (const [id, entry] of state.espMap) {
             if (!live.has(id)) {
                 if (entry.box) {
@@ -259,7 +250,6 @@
         state.espMap.clear();
     }
 
-    // ---------- hotkeys ----------
     function bindKeys() {
         document.addEventListener('keydown', (e) => {
             if (e.repeat) return;
@@ -286,8 +276,22 @@
         }, true);
     }
 
-    // ---------- menu ----------
+    function makeRow(label, valueId, valueText) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;';
+        const l = document.createElement('span');
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.id = valueId;
+        v.textContent = valueText;
+        row.appendChild(l);
+        row.appendChild(v);
+        return { row, value: v };
+    }
+
     function buildMenu() {
+        if (state.menuEl) return;
+
         const el = document.createElement('div');
         el.id = 'krunker-esp-menu';
         el.style.cssText = `
@@ -306,80 +310,141 @@
             display: none;
         `;
 
-        el.innerHTML = `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                <span style="color:#7ee0a1;font-weight:600;letter-spacing:0.5px;">KRUNKER ESP</span>
-                <span id="kesp-close" style="cursor:pointer;color:#8892a6;">x</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:3px 0;">
-                <span>Master [M]</span><span id="kesp-master">ON</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:3px 0;">
-                <span>Box [B]</span><span id="kesp-box">ON</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:3px 0;">
-                <span>Wireframe [V]</span><span id="kesp-wire">OFF</span>
-            </div>
-            <hr style="border:0;border-top:1px solid #2a3140;margin:8px 0;">
-            <div style="display:flex;justify-content:space-between;margin:3px 0;">
-                <span>Enemy</span><input type="color" id="kesp-c-enemy" style="width:36px;height:18px;border:0;background:none;">
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:3px 0;">
-                <span>Team</span><input type="color" id="kesp-c-team" style="width:36px;height:18px;border:0;background:none;">
-            </div>
-            <div style="margin:6px 0 2px 0;">Box opacity <span id="kesp-op-val">0.85</span></div>
-            <input type="range" id="kesp-op" min="0.1" max="1" step="0.05" value="0.85" style="width:100%;">
-            <div style="margin:6px 0 2px 0;">Wire opacity <span id="kesp-wop-val">0.50</span></div>
-            <input type="range" id="kesp-wop" min="0.1" max="1" step="0.05" value="0.5" style="width:100%;">
-            <hr style="border:0;border-top:1px solid #2a3140;margin:8px 0;">
-            <div style="color:#8892a6;font-size:11px;">[N] toggle menu</div>
-        `;
+        // header
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
+        const title = document.createElement('span');
+        title.style.cssText = 'color:#7ee0a1;font-weight:600;letter-spacing:0.5px;';
+        title.textContent = 'KRUNKER ESP';
+        const close = document.createElement('span');
+        close.style.cssText = 'cursor:pointer;color:#8892a6;';
+        close.textContent = 'x';
+        close.addEventListener('click', toggleMenu);
+        header.appendChild(title);
+        header.appendChild(close);
+        el.appendChild(header);
+
+        // toggles
+        const masterRow = makeRow('Master [M]', 'kesp-master', 'ON');
+        const boxRow = makeRow('Box [B]', 'kesp-box', 'ON');
+        const wireRow = makeRow('Wireframe [V]', 'kesp-wire', 'OFF');
+        el.appendChild(masterRow.row);
+        el.appendChild(boxRow.row);
+        el.appendChild(wireRow.row);
+
+        // divider
+        const hr1 = document.createElement('hr');
+        hr1.style.cssText = 'border:0;border-top:1px solid #2a3140;margin:8px 0;';
+        el.appendChild(hr1);
+
+        // colors
+        const enemyColorRow = document.createElement('div');
+        enemyColorRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
+        const enemyColorLbl = document.createElement('span');
+        enemyColorLbl.textContent = 'Enemy';
+        const enemyColorInput = document.createElement('input');
+        enemyColorInput.type = 'color';
+        enemyColorInput.style.cssText = 'width:36px;height:18px;border:0;background:none;';
+        enemyColorInput.value = '#' + CONFIG.enemyColor.toString(16).padStart(6, '0');
+        enemyColorInput.addEventListener('input', (e) => {
+            CONFIG.enemyColor = parseInt(e.target.value.slice(1), 16);
+            save();
+        });
+        enemyColorRow.appendChild(enemyColorLbl);
+        enemyColorRow.appendChild(enemyColorInput);
+        el.appendChild(enemyColorRow);
+
+        const teamColorRow = document.createElement('div');
+        teamColorRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
+        const teamColorLbl = document.createElement('span');
+        teamColorLbl.textContent = 'Team';
+        const teamColorInput = document.createElement('input');
+        teamColorInput.type = 'color';
+        teamColorInput.style.cssText = 'width:36px;height:18px;border:0;background:none;';
+        teamColorInput.value = '#' + CONFIG.teamColor.toString(16).padStart(6, '0');
+        teamColorInput.addEventListener('input', (e) => {
+            CONFIG.teamColor = parseInt(e.target.value.slice(1), 16);
+            save();
+        });
+        teamColorRow.appendChild(teamColorLbl);
+        teamColorRow.appendChild(teamColorInput);
+        el.appendChild(teamColorRow);
+
+        // box opacity
+        const boxOpLabel = document.createElement('div');
+        boxOpLabel.style.cssText = 'margin:6px 0 2px 0;';
+        boxOpLabel.textContent = 'Box opacity ';
+        const boxOpVal = document.createElement('span');
+        boxOpVal.textContent = CONFIG.boxOpacity.toFixed(2);
+        boxOpLabel.appendChild(boxOpVal);
+        el.appendChild(boxOpLabel);
+
+        const boxOpRange = document.createElement('input');
+        boxOpRange.type = 'range';
+        boxOpRange.min = '0.1';
+        boxOpRange.max = '1';
+        boxOpRange.step = '0.05';
+        boxOpRange.value = CONFIG.boxOpacity;
+        boxOpRange.style.width = '100%';
+        boxOpRange.addEventListener('input', (e) => {
+            CONFIG.boxOpacity = parseFloat(e.target.value);
+            boxOpVal.textContent = CONFIG.boxOpacity.toFixed(2);
+            save();
+        });
+        el.appendChild(boxOpRange);
+
+        // wire opacity
+        const wireOpLabel = document.createElement('div');
+        wireOpLabel.style.cssText = 'margin:6px 0 2px 0;';
+        wireOpLabel.textContent = 'Wire opacity ';
+        const wireOpVal = document.createElement('span');
+        wireOpVal.textContent = CONFIG.wireOpacity.toFixed(2);
+        wireOpLabel.appendChild(wireOpVal);
+        el.appendChild(wireOpLabel);
+
+        const wireOpRange = document.createElement('input');
+        wireOpRange.type = 'range';
+        wireOpRange.min = '0.1';
+        wireOpRange.max = '1';
+        wireOpRange.step = '0.05';
+        wireOpRange.value = CONFIG.wireOpacity;
+        wireOpRange.style.width = '100%';
+        wireOpRange.addEventListener('input', (e) => {
+            CONFIG.wireOpacity = parseFloat(e.target.value);
+            wireOpVal.textContent = CONFIG.wireOpacity.toFixed(2);
+            save();
+        });
+        el.appendChild(wireOpRange);
+
+        // divider
+        const hr2 = document.createElement('hr');
+        hr2.style.cssText = 'border:0;border-top:1px solid #2a3140;margin:8px 0;';
+        el.appendChild(hr2);
+
+        // footer
+        const footer = document.createElement('div');
+        footer.style.cssText = 'color:#8892a6;font-size:11px;';
+        footer.textContent = '[N] toggle menu';
+        el.appendChild(footer);
 
         document.body.appendChild(el);
         state.menuEl = el;
-
-        const hex = (n) => '#' + n.toString(16).padStart(6, '0');
-        const $ = (id) => el.querySelector(id);
-
-        $('kesp-close').onclick = toggleMenu;
-        $('kesp-c-enemy').value = hex(CONFIG.enemyColor);
-        $('kesp-c-team').value = hex(CONFIG.teamColor);
-        $('kesp-op').value = CONFIG.boxOpacity;
-        $('kesp-wop').value = CONFIG.wireOpacity;
-        $('kesp-op-val').textContent = CONFIG.boxOpacity.toFixed(2);
-        $('kesp-wop-val').textContent = CONFIG.wireOpacity.toFixed(2);
-
-        $('kesp-c-enemy').oninput = (e) => {
-            CONFIG.enemyColor = parseInt(e.target.value.slice(1), 16);
-            save();
-        };
-        $('kesp-c-team').oninput = (e) => {
-            CONFIG.teamColor = parseInt(e.target.value.slice(1), 16);
-            save();
-        };
-        $('kesp-op').oninput = (e) => {
-            CONFIG.boxOpacity = parseFloat(e.target.value);
-            $('kesp-op-val').textContent = CONFIG.boxOpacity.toFixed(2);
-            save();
-        };
-        $('kesp-wop').oninput = (e) => {
-            CONFIG.wireOpacity = parseFloat(e.target.value);
-            $('kesp-wop-val').textContent = CONFIG.wireOpacity.toFixed(2);
-            save();
-        };
+        state.refs.master = masterRow.value;
+        state.refs.box = boxRow.value;
+        state.refs.wire = wireRow.value;
 
         refreshMenu();
     }
 
     function refreshMenu() {
-        if (!state.menuEl) return;
-        const set = (id, on) => {
-            const n = state.menuEl.querySelector(id);
-            if (n) { n.textContent = on ? 'ON' : 'OFF'; n.style.color = on ? '#7ee0a1' : '#8892a6'; }
+        const set = (node, on) => {
+            if (!node) return;
+            node.textContent = on ? 'ON' : 'OFF';
+            node.style.color = on ? '#7ee0a1' : '#8892a6';
         };
-        set('#kesp-master', CONFIG.enabled);
-        set('#kesp-box', CONFIG.box);
-        set('#kesp-wire', CONFIG.wireframe);
+        set(state.refs.master, CONFIG.enabled);
+        set(state.refs.box, CONFIG.box);
+        set(state.refs.wire, CONFIG.wireframe);
     }
 
     function toggleMenu() {
@@ -388,7 +453,6 @@
         state.menuEl.style.display = state.menuVisible ? 'block' : 'none';
     }
 
-    // ---------- boot ----------
     function boot() {
         load();
         waitForThree((THREE) => {
@@ -396,12 +460,18 @@
         });
         bindKeys();
 
+        // menu só depois que o body existir
         const iv = setInterval(() => {
             if (document.body) {
                 clearInterval(iv);
-                buildMenu();
+                try {
+                    buildMenu();
+                    console.log('[Krunker ESP] loaded');
+                } catch (e) {
+                    console.error('[Krunker ESP] menu error:', e);
+                }
             }
-        }, 120);
+        }, 200);
     }
 
     boot();
