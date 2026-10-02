@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Krunker ESP
 // @namespace    krunker-esp-local
-// @version      1.1
-// @description  Box ESP + Wireframe ESP for Krunker.io — no aimbot, no triggerbot, visual only
+// @version      2.0
+// @description  Box ESP + Wireframe ESP for Krunker.io
 // @author       Kovak
 // @match        *://krunker.io/*
 // @match        *://*.krunker.io/*
@@ -21,23 +21,24 @@
         teamColor: 0x2bff6a,
         boxOpacity: 0.85,
         wireOpacity: 0.5,
-        boxPadding: 1.05,
-        hotkeys: {
-            master: 'KeyM',
-            box: 'KeyB',
-            wireframe: 'KeyV',
-            menu: 'KeyN'
-        }
+        boxPadding: 1.15,
+        hotkeys: { master: 'KeyM', box: 'KeyB', wireframe: 'KeyV', menu: 'KeyN' }
     };
 
     const state = {
         scene: null,
         camera: null,
+        renderer: null,
+        THREE: null,
         espMap: new Map(),
         menuEl: null,
         menuVisible: false,
-        refs: {}
+        refs: {},
+        lastPlayerCount: -1
     };
+
+    function log(...a) { console.log('[ESP]', ...a); }
+    function warn(...a) { console.warn('[ESP]', ...a); }
 
     function load() {
         try {
@@ -46,20 +47,70 @@
         } catch (_) {}
     }
     function save() {
-        try {
-            localStorage.setItem('krunker-esp-cfg', JSON.stringify(CONFIG));
-        } catch (_) {}
+        try { localStorage.setItem('krunker-esp-cfg', JSON.stringify(CONFIG)); } catch (_) {}
     }
 
-    function waitForThree(cb) {
-        const iv = setInterval(() => {
-            if (typeof window.THREE !== 'undefined' && window.THREE.WebGLRenderer) {
-                clearInterval(iv);
-                cb(window.THREE);
+    // ---------- STRATEGY 1: hook getContext to capture renderer ----------
+    function hookGetContext() {
+        const orig = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+            const ctx = orig.call(this, type, ...args);
+            if (type && type.startsWith('webgl') && ctx && !ctx.__espHooked) {
+                ctx.__espHooked = true;
+                ctx.__espCanvas = this;
+                log('WebGL context captured on canvas', this.width, 'x', this.height);
             }
-        }, 120);
+            return ctx;
+        };
     }
 
+    // ---------- STRATEGY 2: scan window for THREE ----------
+    function findTHREE() {
+        if (state.THREE) return state.THREE;
+
+        // direct
+        if (window.THREE && window.THREE.WebGLRenderer) {
+            state.THREE = window.THREE;
+            log('THREE found at window.THREE');
+            return state.THREE;
+        }
+
+        // scan window keys
+        for (const k of Object.keys(window)) {
+            try {
+                const v = window[k];
+                if (v && typeof v === 'object' && v.WebGLRenderer && v.Scene && v.Mesh) {
+                    state.THREE = v;
+                    log('THREE found at window.' + k);
+                    return state.THREE;
+                }
+            } catch (_) {}
+        }
+
+        // webpack module cache
+        try {
+            const chunks = window.webpackChunk || window.webpackChunkkrunker || [];
+            for (const chunk of chunks) {
+                const modules = chunk[1] || {};
+                for (const id in modules) {
+                    try {
+                        const mod = modules[id];
+                        if (typeof mod !== 'function') continue;
+                        const exports = mod.exports || (mod.exports = {});
+                        if (exports.WebGLRenderer && exports.Scene && exports.Mesh) {
+                            state.THREE = exports;
+                            log('THREE found in webpack module', id);
+                            return state.THREE;
+                        }
+                    } catch (_) {}
+                }
+            }
+        } catch (_) {}
+
+        return null;
+    }
+
+    // ---------- STRATEGY 3: hook WebGLRenderer.prototype.render once THREE found ----------
     function hookRenderer(THREE) {
         const proto = THREE.WebGLRenderer.prototype;
         if (proto.__espHooked) return;
@@ -68,34 +119,45 @@
         proto.render = function (sc, cam) {
             state.scene = sc;
             state.camera = cam;
-            try { updateESP(THREE); } catch (e) { console.error('[ESP]', e); }
+            state.renderer = this;
+            try { updateESP(THREE); } catch (e) { warn('update error:', e.message); }
             return orig.apply(this, arguments);
         };
+        log('WebGLRenderer.render hooked');
     }
 
-    function isPlayerMesh(obj) {
-        if (!obj || !obj.isMesh) return false;
-        const p = obj.player || obj.userData?.player;
+    // ---------- STRATEGY 4: scan scene for player-like objects ----------
+    function isPlayerLike(obj) {
+        if (!obj || !obj.isObject3D) return false;
+        const p = obj.player || obj.userData?.player || obj.entity || obj.userData?.entity;
         if (!p) return false;
         if (p.active === false) return false;
-        if (p.isYou === true) return false;
+        if (p.isYou === true || p.isLocal === true) return false;
         return true;
     }
 
+    function isLikelyPlayerMesh(obj) {
+        // fallback: any SkinnedMesh or Mesh with a health-like property
+        if (!obj || !obj.isObject3D) return false;
+        if (obj.isSkinnedMesh) return true;
+        return false;
+    }
+
     function localTeam() {
-        const lp = window.localPlayer || window.me || window.game?.localPlayer;
-        return lp?.team ?? null;
+        const lp = window.localPlayer || window.me || window.game?.localPlayer || window.game?.me;
+        return lp?.team ?? lp?.side ?? null;
     }
 
     function collectPlayers() {
         const list = [];
         if (!state.scene) return list;
         state.scene.traverse((o) => {
-            if (isPlayerMesh(o)) list.push(o);
+            if (isPlayerLike(o)) list.push({ mesh: o, player: o.player || o.userData?.player || o.entity });
         });
         return list;
     }
 
+    // ---------- box ----------
     function buildBox(THREE, mesh, color) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
         const bb = mesh.geometry.boundingBox.clone();
@@ -105,11 +167,8 @@
         const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
         const edges = new THREE.EdgesGeometry(geo);
         const mat = new THREE.LineBasicMaterial({
-            color: color,
-            transparent: true,
-            opacity: CONFIG.boxOpacity,
-            depthTest: false,
-            depthWrite: false
+            color, transparent: true, opacity: CONFIG.boxOpacity,
+            depthTest: false, depthWrite: false
         });
         const line = new THREE.LineSegments(edges, mat);
         line.renderOrder = 9999;
@@ -127,6 +186,7 @@
         box.scale.copy(mesh.scale);
     }
 
+    // ---------- wireframe ----------
     function buildWire(THREE, mesh, color) {
         const clone = new THREE.Group();
         clone.renderOrder = 9998;
@@ -134,12 +194,8 @@
         mesh.traverse((child) => {
             if (child.isMesh && child.geometry) {
                 const mat = new THREE.MeshBasicMaterial({
-                    color: color,
-                    wireframe: true,
-                    transparent: true,
-                    opacity: CONFIG.wireOpacity,
-                    depthTest: false,
-                    depthWrite: false
+                    color, wireframe: true, transparent: true,
+                    opacity: CONFIG.wireOpacity, depthTest: false, depthWrite: false
                 });
                 const m = new THREE.Mesh(child.geometry, mat);
                 m.renderOrder = 9998;
@@ -153,27 +209,35 @@
         return clone;
     }
 
+    function disposeGroup(g) {
+        g.traverse((c) => {
+            if (c.isMesh) { c.geometry?.dispose?.(); c.material?.dispose?.(); }
+        });
+    }
+
+    // ---------- main update ----------
     function updateESP(THREE) {
         if (!state.scene) return;
         if (!CONFIG.enabled) { teardownAll(); return; }
 
         const players = collectPlayers();
+        if (players.length !== state.lastPlayerCount) {
+            log('players found:', players.length);
+            state.lastPlayerCount = players.length;
+        }
+
         const lteam = localTeam();
         const live = new Set();
 
-        for (const mesh of players) {
+        for (const { mesh, player } of players) {
             const id = mesh.uuid;
             live.add(id);
 
-            const p = mesh.player || mesh.userData?.player;
-            const isEnemy = lteam == null ? true : (p.team !== lteam);
+            const isEnemy = lteam == null ? true : (player.team !== lteam);
             const color = isEnemy ? CONFIG.enemyColor : CONFIG.teamColor;
 
             let entry = state.espMap.get(id);
-            if (!entry) {
-                entry = { box: null, wire: null };
-                state.espMap.set(id, entry);
-            }
+            if (!entry) { entry = { box: null, wire: null }; state.espMap.set(id, entry); }
 
             if (CONFIG.box) {
                 if (!entry.box) {
@@ -196,9 +260,7 @@
                     entry.wire = buildWire(THREE, mesh, color);
                     state.scene.add(entry.wire);
                 } else {
-                    entry.wire.traverse((c) => {
-                        if (c.isMesh) c.material.color.setHex(color);
-                    });
+                    entry.wire.traverse((c) => { if (c.isMesh) c.material.color.setHex(color); });
                 }
                 entry.wire.position.copy(mesh.position);
                 entry.wire.quaternion.copy(mesh.quaternion);
@@ -226,91 +288,101 @@
         }
     }
 
-    function disposeGroup(g) {
-        g.traverse((c) => {
-            if (c.isMesh) {
-                c.geometry?.dispose?.();
-                c.material?.dispose?.();
-            }
-        });
-    }
-
     function teardownAll() {
         for (const [, entry] of state.espMap) {
-            if (entry.box) {
-                state.scene?.remove(entry.box);
-                entry.box.geometry?.dispose();
-                entry.box.material?.dispose();
-            }
-            if (entry.wire) {
-                disposeGroup(entry.wire);
-                state.scene?.remove(entry.wire);
-            }
+            if (entry.box) { state.scene?.remove(entry.box); entry.box.geometry?.dispose(); entry.box.material?.dispose(); }
+            if (entry.wire) { disposeGroup(entry.wire); state.scene?.remove(entry.wire); }
         }
         state.espMap.clear();
     }
 
+    // ---------- debug ----------
+    window.__espDebug = {
+        log() {
+            console.log('=== ESP DEBUG ===');
+            console.log('THREE:', state.THREE ? 'found' : 'NOT FOUND');
+            console.log('scene:', state.scene ? state.scene.type + ' (' + state.scene.children.length + ' children)' : 'null');
+            console.log('camera:', state.camera ? state.camera.type : 'null');
+            console.log('renderer:', state.renderer ? 'captured' : 'null');
+            console.log('espMap size:', state.espMap.size);
+            console.log('--- scene children ---');
+            if (state.scene) {
+                state.scene.children.slice(0, 30).forEach((c, i) => {
+                    console.log(i, c.type, c.name || '(no name)', 'children:', c.children?.length || 0,
+                        'isSkinnedMesh:', !!c.isSkinnedMesh, 'player:', !!(c.player || c.userData?.player));
+                });
+            }
+            console.log('--- window keys with player/entity ---');
+            Object.keys(window).forEach(k => {
+                try {
+                    const v = window[k];
+                    if (v && typeof v === 'object' && (v.players || v.entities)) {
+                        console.log('window.' + k, '-> players:', v.players?.length, 'entities:', v.entities?.length);
+                    }
+                } catch (_) {}
+            });
+        },
+        findPlayers() {
+            const list = collectPlayers();
+            console.log('found', list.length, 'players');
+            list.forEach(({ mesh, player }) => {
+                console.log(mesh.uuid, mesh.type, 'pos:', mesh.position.toArray(), 'player keys:', Object.keys(player || {}));
+            });
+        },
+        dump(obj) {
+            const o = obj || state.scene;
+            if (!o) return console.log('nothing to dump');
+            console.log('dumping', o.type, o.name);
+            o.traverse((c) => {
+                if (c.isMesh || c.isSkinnedMesh || c.isGroup) {
+                    console.log(c.type, c.name, 'children:', c.children.length, 'keys:', Object.keys(c).slice(0, 10));
+                }
+            });
+        }
+    };
+
+    // ---------- hotkeys ----------
     function bindKeys() {
         document.addEventListener('keydown', (e) => {
             if (e.repeat) return;
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
-
             switch (e.code) {
                 case CONFIG.hotkeys.master:
-                    CONFIG.enabled = !CONFIG.enabled;
-                    save(); refreshMenu();
-                    break;
+                    CONFIG.enabled = !CONFIG.enabled; save(); refreshMenu(); break;
                 case CONFIG.hotkeys.box:
-                    CONFIG.box = !CONFIG.box;
-                    save(); refreshMenu();
-                    break;
+                    CONFIG.box = !CONFIG.box; save(); refreshMenu(); break;
                 case CONFIG.hotkeys.wireframe:
-                    CONFIG.wireframe = !CONFIG.wireframe;
-                    save(); refreshMenu();
-                    break;
+                    CONFIG.wireframe = !CONFIG.wireframe; save(); refreshMenu(); break;
                 case CONFIG.hotkeys.menu:
-                    toggleMenu();
-                    break;
+                    toggleMenu(); break;
             }
         }, true);
     }
 
+    // ---------- menu ----------
     function makeRow(label, valueId, valueText) {
         const row = document.createElement('div');
         row.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;';
-        const l = document.createElement('span');
-        l.textContent = label;
-        const v = document.createElement('span');
-        v.id = valueId;
-        v.textContent = valueText;
-        row.appendChild(l);
-        row.appendChild(v);
+        const l = document.createElement('span'); l.textContent = label;
+        const v = document.createElement('span'); v.id = valueId; v.textContent = valueText;
+        row.appendChild(l); row.appendChild(v);
         return { row, value: v };
     }
 
     function buildMenu() {
         if (state.menuEl) return;
-
         const el = document.createElement('div');
         el.id = 'krunker-esp-menu';
         el.style.cssText = `
             position: fixed; top: 12px; right: 12px;
-            background: rgba(8,10,12,0.92);
-            color: #d8e0ea;
+            background: rgba(8,10,12,0.92); color: #d8e0ea;
             font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size: 12px; line-height: 1.5;
-            padding: 12px 14px;
-            border: 1px solid #2a3140;
-            border-radius: 6px;
-            z-index: 2147483647;
-            width: 230px;
-            user-select: none;
-            box-shadow: 0 6px 24px rgba(0,0,0,0.55);
-            display: none;
+            padding: 12px 14px; border: 1px solid #2a3140; border-radius: 6px;
+            z-index: 2147483647; width: 230px; user-select: none;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.55); display: none;
         `;
-
-        // header
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
         const title = document.createElement('span');
@@ -320,111 +392,53 @@
         close.style.cssText = 'cursor:pointer;color:#8892a6;';
         close.textContent = 'x';
         close.addEventListener('click', toggleMenu);
-        header.appendChild(title);
-        header.appendChild(close);
-        el.appendChild(header);
+        header.appendChild(title); header.appendChild(close); el.appendChild(header);
 
-        // toggles
         const masterRow = makeRow('Master [M]', 'kesp-master', 'ON');
         const boxRow = makeRow('Box [B]', 'kesp-box', 'ON');
         const wireRow = makeRow('Wireframe [V]', 'kesp-wire', 'OFF');
-        el.appendChild(masterRow.row);
-        el.appendChild(boxRow.row);
-        el.appendChild(wireRow.row);
+        el.appendChild(masterRow.row); el.appendChild(boxRow.row); el.appendChild(wireRow.row);
 
-        // divider
         const hr1 = document.createElement('hr');
         hr1.style.cssText = 'border:0;border-top:1px solid #2a3140;margin:8px 0;';
         el.appendChild(hr1);
 
-        // colors
-        const enemyColorRow = document.createElement('div');
-        enemyColorRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
-        const enemyColorLbl = document.createElement('span');
-        enemyColorLbl.textContent = 'Enemy';
-        const enemyColorInput = document.createElement('input');
-        enemyColorInput.type = 'color';
-        enemyColorInput.style.cssText = 'width:36px;height:18px;border:0;background:none;';
-        enemyColorInput.value = '#' + CONFIG.enemyColor.toString(16).padStart(6, '0');
-        enemyColorInput.addEventListener('input', (e) => {
-            CONFIG.enemyColor = parseInt(e.target.value.slice(1), 16);
-            save();
-        });
-        enemyColorRow.appendChild(enemyColorLbl);
-        enemyColorRow.appendChild(enemyColorInput);
-        el.appendChild(enemyColorRow);
+        const eRow = document.createElement('div');
+        eRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
+        const eLbl = document.createElement('span'); eLbl.textContent = 'Enemy';
+        const eIn = document.createElement('input'); eIn.type = 'color';
+        eIn.style.cssText = 'width:36px;height:18px;border:0;background:none;';
+        eIn.value = '#' + CONFIG.enemyColor.toString(16).padStart(6, '0');
+        eIn.addEventListener('input', (e) => { CONFIG.enemyColor = parseInt(e.target.value.slice(1), 16); save(); });
+        eRow.appendChild(eLbl); eRow.appendChild(eIn); el.appendChild(eRow);
 
-        const teamColorRow = document.createElement('div');
-        teamColorRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
-        const teamColorLbl = document.createElement('span');
-        teamColorLbl.textContent = 'Team';
-        const teamColorInput = document.createElement('input');
-        teamColorInput.type = 'color';
-        teamColorInput.style.cssText = 'width:36px;height:18px;border:0;background:none;';
-        teamColorInput.value = '#' + CONFIG.teamColor.toString(16).padStart(6, '0');
-        teamColorInput.addEventListener('input', (e) => {
-            CONFIG.teamColor = parseInt(e.target.value.slice(1), 16);
-            save();
-        });
-        teamColorRow.appendChild(teamColorLbl);
-        teamColorRow.appendChild(teamColorInput);
-        el.appendChild(teamColorRow);
+        const tRow = document.createElement('div');
+        tRow.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;align-items:center;';
+        const tLbl = document.createElement('span'); tLbl.textContent = 'Team';
+        const tIn = document.createElement('input'); tIn.type = 'color';
+        tIn.style.cssText = 'width:36px;height:18px;border:0;background:none;';
+        tIn.value = '#' + CONFIG.teamColor.toString(16).padStart(6, '0');
+        tIn.addEventListener('input', (e) => { CONFIG.teamColor = parseInt(e.target.value.slice(1), 16); save(); });
+        tRow.appendChild(tLbl); tRow.appendChild(tIn); el.appendChild(tRow);
 
-        // box opacity
-        const boxOpLabel = document.createElement('div');
-        boxOpLabel.style.cssText = 'margin:6px 0 2px 0;';
-        boxOpLabel.textContent = 'Box opacity ';
-        const boxOpVal = document.createElement('span');
-        boxOpVal.textContent = CONFIG.boxOpacity.toFixed(2);
-        boxOpLabel.appendChild(boxOpVal);
-        el.appendChild(boxOpLabel);
+        const opLabel = document.createElement('div');
+        opLabel.style.cssText = 'margin:6px 0 2px 0;';
+        opLabel.textContent = 'Box opacity ';
+        const opVal = document.createElement('span'); opVal.textContent = CONFIG.boxOpacity.toFixed(2);
+        opLabel.appendChild(opVal); el.appendChild(opLabel);
+        const opRange = document.createElement('input');
+        opRange.type = 'range'; opRange.min = '0.1'; opRange.max = '1'; opRange.step = '0.05';
+        opRange.value = CONFIG.boxOpacity; opRange.style.width = '100%';
+        opRange.addEventListener('input', (e) => { CONFIG.boxOpacity = parseFloat(e.target.value); opVal.textContent = CONFIG.boxOpacity.toFixed(2); save(); });
+        el.appendChild(opRange);
 
-        const boxOpRange = document.createElement('input');
-        boxOpRange.type = 'range';
-        boxOpRange.min = '0.1';
-        boxOpRange.max = '1';
-        boxOpRange.step = '0.05';
-        boxOpRange.value = CONFIG.boxOpacity;
-        boxOpRange.style.width = '100%';
-        boxOpRange.addEventListener('input', (e) => {
-            CONFIG.boxOpacity = parseFloat(e.target.value);
-            boxOpVal.textContent = CONFIG.boxOpacity.toFixed(2);
-            save();
-        });
-        el.appendChild(boxOpRange);
-
-        // wire opacity
-        const wireOpLabel = document.createElement('div');
-        wireOpLabel.style.cssText = 'margin:6px 0 2px 0;';
-        wireOpLabel.textContent = 'Wire opacity ';
-        const wireOpVal = document.createElement('span');
-        wireOpVal.textContent = CONFIG.wireOpacity.toFixed(2);
-        wireOpLabel.appendChild(wireOpVal);
-        el.appendChild(wireOpLabel);
-
-        const wireOpRange = document.createElement('input');
-        wireOpRange.type = 'range';
-        wireOpRange.min = '0.1';
-        wireOpRange.max = '1';
-        wireOpRange.step = '0.05';
-        wireOpRange.value = CONFIG.wireOpacity;
-        wireOpRange.style.width = '100%';
-        wireOpRange.addEventListener('input', (e) => {
-            CONFIG.wireOpacity = parseFloat(e.target.value);
-            wireOpVal.textContent = CONFIG.wireOpacity.toFixed(2);
-            save();
-        });
-        el.appendChild(wireOpRange);
-
-        // divider
         const hr2 = document.createElement('hr');
         hr2.style.cssText = 'border:0;border-top:1px solid #2a3140;margin:8px 0;';
         el.appendChild(hr2);
 
-        // footer
         const footer = document.createElement('div');
         footer.style.cssText = 'color:#8892a6;font-size:11px;';
-        footer.textContent = '[N] toggle menu';
+        footer.innerHTML = '[N] menu &nbsp; [B] box &nbsp; [V] wire<br>Debug: <code>__espDebug.log()</code>';
         el.appendChild(footer);
 
         document.body.appendChild(el);
@@ -432,7 +446,6 @@
         state.refs.master = masterRow.value;
         state.refs.box = boxRow.value;
         state.refs.wire = wireRow.value;
-
         refreshMenu();
     }
 
@@ -453,25 +466,44 @@
         state.menuEl.style.display = state.menuVisible ? 'block' : 'none';
     }
 
+    // ---------- boot ----------
     function boot() {
         load();
-        waitForThree((THREE) => {
-            hookRenderer(THREE);
-        });
+        hookGetContext();
         bindKeys();
 
-        // menu só depois que o body existir
         const iv = setInterval(() => {
-            if (document.body) {
-                clearInterval(iv);
-                try {
-                    buildMenu();
-                    console.log('[Krunker ESP] loaded');
-                } catch (e) {
-                    console.error('[Krunker ESP] menu error:', e);
+            if (document.body) { clearInterval(iv); buildMenu(); }
+        }, 200);
+
+        // try to find THREE every 500ms
+        const threeIv = setInterval(() => {
+            const THREE = findTHREE();
+            if (THREE) {
+                clearInterval(threeIv);
+                hookRenderer(THREE);
+                log('hook installed, waiting for scene...');
+            }
+        }, 500);
+
+        // fallback: also try rAF-based scene detection
+        let rafFrame = 0;
+        function rafLoop() {
+            rafFrame++;
+            if (!state.scene && state.THREE && rafFrame % 60 === 0) {
+                // try to find scene in window
+                for (const k of Object.keys(window)) {
+                    try {
+                        const v = window[k];
+                        if (v && v.isScene && v.children) { state.scene = v; log('scene found via rAF at window.' + k); break; }
+                    } catch (_) {}
                 }
             }
-        }, 200);
+            requestAnimationFrame(rafLoop);
+        }
+        requestAnimationFrame(rafLoop);
+
+        log('booted');
     }
 
     boot();
