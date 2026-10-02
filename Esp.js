@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Krunker ESP
 // @namespace    krunker-esp-local
-// @version      2.0
+// @version      2.1
 // @description  Box ESP + Wireframe ESP for Krunker.io
 // @author       Kovak
 // @match        *://krunker.io/*
@@ -26,91 +26,53 @@
     };
 
     const state = {
-        scene: null,
-        camera: null,
-        renderer: null,
-        THREE: null,
-        espMap: new Map(),
-        menuEl: null,
-        menuVisible: false,
-        refs: {},
-        lastPlayerCount: -1
+        scene: null, camera: null, renderer: null, THREE: null,
+        espMap: new Map(), menuEl: null, menuVisible: false,
+        refs: {}, lastPlayerCount: -1
     };
 
-    function log(...a) { console.log('[ESP]', ...a); }
-    function warn(...a) { console.warn('[ESP]', ...a); }
+    const log = (...a) => console.log('[ESP]', ...a);
+    const warn = (...a) => console.warn('[ESP]', ...a);
 
     function load() {
-        try {
-            const raw = localStorage.getItem('krunker-esp-cfg');
-            if (raw) Object.assign(CONFIG, JSON.parse(raw));
-        } catch (_) {}
+        try { const r = localStorage.getItem('krunker-esp-cfg'); if (r) Object.assign(CONFIG, JSON.parse(r)); } catch (_) {}
     }
     function save() {
         try { localStorage.setItem('krunker-esp-cfg', JSON.stringify(CONFIG)); } catch (_) {}
     }
 
-    // ---------- STRATEGY 1: hook getContext to capture renderer ----------
-    function hookGetContext() {
-        const orig = HTMLCanvasElement.prototype.getContext;
-        HTMLCanvasElement.prototype.getContext = function (type, ...args) {
-            const ctx = orig.call(this, type, ...args);
-            if (type && type.startsWith('webgl') && ctx && !ctx.__espHooked) {
-                ctx.__espHooked = true;
-                ctx.__espCanvas = this;
-                log('WebGL context captured on canvas', this.width, 'x', this.height);
-            }
-            return ctx;
-        };
-    }
-
-    // ---------- STRATEGY 2: scan window for THREE ----------
+    // find THREE by scanning window + webpack cache — read-only, no hooks
     function findTHREE() {
         if (state.THREE) return state.THREE;
-
-        // direct
-        if (window.THREE && window.THREE.WebGLRenderer) {
-            state.THREE = window.THREE;
-            log('THREE found at window.THREE');
-            return state.THREE;
-        }
-
-        // scan window keys
+        if (window.THREE && window.THREE.WebGLRenderer) { state.THREE = window.THREE; log('THREE at window.THREE'); return state.THREE; }
         for (const k of Object.keys(window)) {
             try {
                 const v = window[k];
                 if (v && typeof v === 'object' && v.WebGLRenderer && v.Scene && v.Mesh) {
-                    state.THREE = v;
-                    log('THREE found at window.' + k);
-                    return state.THREE;
+                    state.THREE = v; log('THREE at window.' + k); return state.THREE;
                 }
             } catch (_) {}
         }
-
-        // webpack module cache
         try {
             const chunks = window.webpackChunk || window.webpackChunkkrunker || [];
             for (const chunk of chunks) {
-                const modules = chunk[1] || {};
-                for (const id in modules) {
+                const mods = chunk[1] || {};
+                for (const id in mods) {
                     try {
-                        const mod = modules[id];
+                        const mod = mods[id];
                         if (typeof mod !== 'function') continue;
-                        const exports = mod.exports || (mod.exports = {});
-                        if (exports.WebGLRenderer && exports.Scene && exports.Mesh) {
-                            state.THREE = exports;
-                            log('THREE found in webpack module', id);
-                            return state.THREE;
+                        const ex = mod.exports || (mod.exports = {});
+                        if (ex.WebGLRenderer && ex.Scene && ex.Mesh) {
+                            state.THREE = ex; log('THREE at webpack module ' + id); return state.THREE;
                         }
                     } catch (_) {}
                 }
             }
         } catch (_) {}
-
         return null;
     }
 
-    // ---------- STRATEGY 3: hook WebGLRenderer.prototype.render once THREE found ----------
+    // hook render on the instance's prototype AFTER THREE is loaded
     function hookRenderer(THREE) {
         const proto = THREE.WebGLRenderer.prototype;
         if (proto.__espHooked) return;
@@ -123,24 +85,17 @@
             try { updateESP(THREE); } catch (e) { warn('update error:', e.message); }
             return orig.apply(this, arguments);
         };
-        log('WebGLRenderer.render hooked');
+        log('render hooked');
     }
 
-    // ---------- STRATEGY 4: scan scene for player-like objects ----------
+    // player detection — multiple fallbacks so we don't miss the real structure
     function isPlayerLike(obj) {
         if (!obj || !obj.isObject3D) return false;
         const p = obj.player || obj.userData?.player || obj.entity || obj.userData?.entity;
         if (!p) return false;
         if (p.active === false) return false;
-        if (p.isYou === true || p.isLocal === true) return false;
+        if (p.isYou === true || p.isLocal === true || p.isMe === true) return false;
         return true;
-    }
-
-    function isLikelyPlayerMesh(obj) {
-        // fallback: any SkinnedMesh or Mesh with a health-like property
-        if (!obj || !obj.isObject3D) return false;
-        if (obj.isSkinnedMesh) return true;
-        return false;
     }
 
     function localTeam() {
@@ -157,19 +112,14 @@
         return list;
     }
 
-    // ---------- box ----------
     function buildBox(THREE, mesh, color) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
         const bb = mesh.geometry.boundingBox.clone();
         const size = bb.getSize(new THREE.Vector3()).multiplyScalar(CONFIG.boxPadding);
         const center = bb.getCenter(new THREE.Vector3());
-
         const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
         const edges = new THREE.EdgesGeometry(geo);
-        const mat = new THREE.LineBasicMaterial({
-            color, transparent: true, opacity: CONFIG.boxOpacity,
-            depthTest: false, depthWrite: false
-        });
+        const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: CONFIG.boxOpacity, depthTest: false, depthWrite: false });
         const line = new THREE.LineSegments(edges, mat);
         line.renderOrder = 9999;
         line.frustumCulled = false;
@@ -186,17 +136,13 @@
         box.scale.copy(mesh.scale);
     }
 
-    // ---------- wireframe ----------
     function buildWire(THREE, mesh, color) {
         const clone = new THREE.Group();
         clone.renderOrder = 9998;
         clone.frustumCulled = false;
         mesh.traverse((child) => {
             if (child.isMesh && child.geometry) {
-                const mat = new THREE.MeshBasicMaterial({
-                    color, wireframe: true, transparent: true,
-                    opacity: CONFIG.wireOpacity, depthTest: false, depthWrite: false
-                });
+                const mat = new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: CONFIG.wireOpacity, depthTest: false, depthWrite: false });
                 const m = new THREE.Mesh(child.geometry, mat);
                 m.renderOrder = 9998;
                 m.frustumCulled = false;
@@ -210,58 +156,35 @@
     }
 
     function disposeGroup(g) {
-        g.traverse((c) => {
-            if (c.isMesh) { c.geometry?.dispose?.(); c.material?.dispose?.(); }
-        });
+        g.traverse((c) => { if (c.isMesh) { c.geometry?.dispose?.(); c.material?.dispose?.(); } });
     }
 
-    // ---------- main update ----------
     function updateESP(THREE) {
         if (!state.scene) return;
         if (!CONFIG.enabled) { teardownAll(); return; }
-
         const players = collectPlayers();
-        if (players.length !== state.lastPlayerCount) {
-            log('players found:', players.length);
-            state.lastPlayerCount = players.length;
-        }
-
+        if (players.length !== state.lastPlayerCount) { log('players:', players.length); state.lastPlayerCount = players.length; }
         const lteam = localTeam();
         const live = new Set();
-
         for (const { mesh, player } of players) {
             const id = mesh.uuid;
             live.add(id);
-
             const isEnemy = lteam == null ? true : (player.team !== lteam);
             const color = isEnemy ? CONFIG.enemyColor : CONFIG.teamColor;
-
             let entry = state.espMap.get(id);
             if (!entry) { entry = { box: null, wire: null }; state.espMap.set(id, entry); }
-
             if (CONFIG.box) {
-                if (!entry.box) {
-                    entry.box = buildBox(THREE, mesh, color);
-                    state.scene.add(entry.box);
-                } else {
-                    entry.box.material.color.setHex(color);
-                    entry.box.material.opacity = CONFIG.boxOpacity;
-                }
+                if (!entry.box) { entry.box = buildBox(THREE, mesh, color); state.scene.add(entry.box); }
+                else { entry.box.material.color.setHex(color); entry.box.material.opacity = CONFIG.boxOpacity; }
                 positionBox(entry.box, mesh);
             } else if (entry.box) {
                 state.scene.remove(entry.box);
-                entry.box.geometry?.dispose();
-                entry.box.material?.dispose();
+                entry.box.geometry?.dispose(); entry.box.material?.dispose();
                 entry.box = null;
             }
-
             if (CONFIG.wireframe) {
-                if (!entry.wire) {
-                    entry.wire = buildWire(THREE, mesh, color);
-                    state.scene.add(entry.wire);
-                } else {
-                    entry.wire.traverse((c) => { if (c.isMesh) c.material.color.setHex(color); });
-                }
+                if (!entry.wire) { entry.wire = buildWire(THREE, mesh, color); state.scene.add(entry.wire); }
+                else { entry.wire.traverse((c) => { if (c.isMesh) c.material.color.setHex(color); }); }
                 entry.wire.position.copy(mesh.position);
                 entry.wire.quaternion.copy(mesh.quaternion);
                 entry.wire.scale.copy(mesh.scale);
@@ -271,18 +194,10 @@
                 entry.wire = null;
             }
         }
-
         for (const [id, entry] of state.espMap) {
             if (!live.has(id)) {
-                if (entry.box) {
-                    state.scene.remove(entry.box);
-                    entry.box.geometry?.dispose();
-                    entry.box.material?.dispose();
-                }
-                if (entry.wire) {
-                    disposeGroup(entry.wire);
-                    state.scene.remove(entry.wire);
-                }
+                if (entry.box) { state.scene.remove(entry.box); entry.box.geometry?.dispose(); entry.box.material?.dispose(); }
+                if (entry.wire) { disposeGroup(entry.wire); state.scene.remove(entry.wire); }
                 state.espMap.delete(id);
             }
         }
@@ -296,7 +211,7 @@
         state.espMap.clear();
     }
 
-    // ---------- debug ----------
+    // debug — the important part now
     window.__espDebug = {
         log() {
             console.log('=== ESP DEBUG ===');
@@ -305,14 +220,14 @@
             console.log('camera:', state.camera ? state.camera.type : 'null');
             console.log('renderer:', state.renderer ? 'captured' : 'null');
             console.log('espMap size:', state.espMap.size);
-            console.log('--- scene children ---');
+            console.log('--- scene children (first 30) ---');
             if (state.scene) {
                 state.scene.children.slice(0, 30).forEach((c, i) => {
                     console.log(i, c.type, c.name || '(no name)', 'children:', c.children?.length || 0,
-                        'isSkinnedMesh:', !!c.isSkinnedMesh, 'player:', !!(c.player || c.userData?.player));
+                        'isSkinnedMesh:', !!c.isSkinnedMesh, 'hasPlayer:', !!(c.player || c.userData?.player));
                 });
             }
-            console.log('--- window keys with player/entity ---');
+            console.log('--- window keys with players/entities ---');
             Object.keys(window).forEach(k => {
                 try {
                     const v = window[k];
@@ -335,32 +250,41 @@
             console.log('dumping', o.type, o.name);
             o.traverse((c) => {
                 if (c.isMesh || c.isSkinnedMesh || c.isGroup) {
-                    console.log(c.type, c.name, 'children:', c.children.length, 'keys:', Object.keys(c).slice(0, 10));
+                    console.log(c.type, c.name, 'children:', c.children.length, 'keys:', Object.keys(c).slice(0, 15));
                 }
+            });
+        },
+        // list all window keys that look like THREE objects
+        scanWindow() {
+            console.log('--- window scan ---');
+            Object.keys(window).forEach(k => {
+                try {
+                    const v = window[k];
+                    if (!v || typeof v !== 'object') return;
+                    if (v.isScene) console.log('SCENE:', 'window.' + k);
+                    if (v.isCamera) console.log('CAMERA:', 'window.' + k, v.type);
+                    if (v.isWebGLRenderer) console.log('RENDERER:', 'window.' + k);
+                    if (v.isObject3D && !v.isScene) console.log('OBJ3D:', 'window.' + k, v.type, v.name);
+                    if (v.WebGLRenderer && v.Scene) console.log('THREE MODULE:', 'window.' + k);
+                } catch (_) {}
             });
         }
     };
 
-    // ---------- hotkeys ----------
     function bindKeys() {
         document.addEventListener('keydown', (e) => {
             if (e.repeat) return;
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
             switch (e.code) {
-                case CONFIG.hotkeys.master:
-                    CONFIG.enabled = !CONFIG.enabled; save(); refreshMenu(); break;
-                case CONFIG.hotkeys.box:
-                    CONFIG.box = !CONFIG.box; save(); refreshMenu(); break;
-                case CONFIG.hotkeys.wireframe:
-                    CONFIG.wireframe = !CONFIG.wireframe; save(); refreshMenu(); break;
-                case CONFIG.hotkeys.menu:
-                    toggleMenu(); break;
+                case CONFIG.hotkeys.master: CONFIG.enabled = !CONFIG.enabled; save(); refreshMenu(); break;
+                case CONFIG.hotkeys.box: CONFIG.box = !CONFIG.box; save(); refreshMenu(); break;
+                case CONFIG.hotkeys.wireframe: CONFIG.wireframe = !CONFIG.wireframe; save(); refreshMenu(); break;
+                case CONFIG.hotkeys.menu: toggleMenu(); break;
             }
         }, true);
     }
 
-    // ---------- menu ----------
     function makeRow(label, valueId, valueText) {
         const row = document.createElement('div');
         row.style.cssText = 'display:flex;justify-content:space-between;margin:3px 0;';
@@ -380,7 +304,7 @@
             font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size: 12px; line-height: 1.5;
             padding: 12px 14px; border: 1px solid #2a3140; border-radius: 6px;
-            z-index: 2147483647; width: 230px; user-select: none;
+            z-index: 2147483647; width: 240px; user-select: none;
             box-shadow: 0 6px 24px rgba(0,0,0,0.55); display: none;
         `;
         const header = document.createElement('div');
@@ -438,7 +362,7 @@
 
         const footer = document.createElement('div');
         footer.style.cssText = 'color:#8892a6;font-size:11px;';
-        footer.innerHTML = '[N] menu &nbsp; [B] box &nbsp; [V] wire<br>Debug: <code>__espDebug.log()</code>';
+        footer.innerHTML = '[N] menu &nbsp; [B] box &nbsp; [V] wire<br><code>__espDebug.log()</code><br><code>__espDebug.scanWindow()</code>';
         el.appendChild(footer);
 
         document.body.appendChild(el);
@@ -450,11 +374,7 @@
     }
 
     function refreshMenu() {
-        const set = (node, on) => {
-            if (!node) return;
-            node.textContent = on ? 'ON' : 'OFF';
-            node.style.color = on ? '#7ee0a1' : '#8892a6';
-        };
+        const set = (node, on) => { if (!node) return; node.textContent = on ? 'ON' : 'OFF'; node.style.color = on ? '#7ee0a1' : '#8892a6'; };
         set(state.refs.master, CONFIG.enabled);
         set(state.refs.box, CONFIG.box);
         set(state.refs.wire, CONFIG.wireframe);
@@ -466,44 +386,15 @@
         state.menuEl.style.display = state.menuVisible ? 'block' : 'none';
     }
 
-    // ---------- boot ----------
     function boot() {
         load();
-        hookGetContext();
         bindKeys();
-
-        const iv = setInterval(() => {
-            if (document.body) { clearInterval(iv); buildMenu(); }
-        }, 200);
-
-        // try to find THREE every 500ms
+        const iv = setInterval(() => { if (document.body) { clearInterval(iv); buildMenu(); } }, 200);
         const threeIv = setInterval(() => {
             const THREE = findTHREE();
-            if (THREE) {
-                clearInterval(threeIv);
-                hookRenderer(THREE);
-                log('hook installed, waiting for scene...');
-            }
-        }, 500);
-
-        // fallback: also try rAF-based scene detection
-        let rafFrame = 0;
-        function rafLoop() {
-            rafFrame++;
-            if (!state.scene && state.THREE && rafFrame % 60 === 0) {
-                // try to find scene in window
-                for (const k of Object.keys(window)) {
-                    try {
-                        const v = window[k];
-                        if (v && v.isScene && v.children) { state.scene = v; log('scene found via rAF at window.' + k); break; }
-                    } catch (_) {}
-                }
-            }
-            requestAnimationFrame(rafLoop);
-        }
-        requestAnimationFrame(rafLoop);
-
-        log('booted');
+            if (THREE) { clearInterval(threeIv); hookRenderer(THREE); }
+        }, 800);
+        log('booted — waiting for THREE');
     }
 
     boot();
